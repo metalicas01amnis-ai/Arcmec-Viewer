@@ -252,7 +252,7 @@
         <div class="prop-group">
           <div class="prop-group-title">Atributos Tekla / Supabase</div>
           <div id="ifc-custom-props">
-            <div class="prop-row"><span>Status:</span> <strong>Aguardando seleção no modelo 3D...</strong></div>
+            <div class="prop-row"><span>Status:</span> <strong>Aguardando dados...</strong></div>
           </div>
         </div>
       </div>
@@ -264,7 +264,6 @@
     const SUPABASE_KEY = "sb_publishable_hE8XLIFJ3LKr-M3GJmWpww_F69Xaqxp";
 
     let cachedElements = [];
-    let loadedModel = null;
 
     if (typeof OV !== 'undefined' && typeof OV.SetExternalLibLocation === 'function') {
       OV.SetExternalLibLocation('https://cdn.jsdelivr.net/npm/online-3d-viewer@0.18.0/build/engine/libs/');
@@ -310,17 +309,21 @@
         setTimeout(() => loadingOverlay.style.display = 'none', 400);
       };
 
-      // Trava de segurança: oculta o overlay após 8s mesmo que o web-ifc emita avisos de curva
-      setTimeout(hideOverlay, 8000);
+      setTimeout(hideOverlay, 6000);
 
-      // Busca propriedades processadas pelo Tekla/Python no Supabase
       fetchTeklaPropertiesFromSupabase(fileName);
 
       try {
         const embeddedViewer = new OV.EmbeddedViewer(parentDiv, {
           backgroundColor: new OV.RGBAColor(15, 20, 28, 255),
           defaultColor: new OV.RGBColor(41, 98, 255),
-          edgeSettings: new OV.EdgeSettings(true, new OV.RGBColor(15, 20, 28), 1)
+          edgeSettings: new OV.EdgeSettings(true, new OV.RGBColor(15, 20, 28), 1),
+          onSelect: (selection) => {
+            sidebar.classList.remove('collapsed');
+            if (selection && selection.meshId !== null) {
+              displaySelectedElementProps(selection.meshId);
+            }
+          }
         });
 
         embeddedViewer.LoadModelFromUrlList([decodedUrl], {
@@ -328,9 +331,7 @@
             const innerViewer = embeddedViewer.GetViewer();
             if (innerViewer) innerViewer.FitToWindow();
             if (importResult && importResult.model) {
-              loadedModel = importResult.model;
-              calculateGeometryData(loadedModel);
-              setupClickSelection(embeddedViewer);
+              calculateGeometryData(importResult.model);
             }
             hideOverlay();
           },
@@ -358,6 +359,9 @@
           if (data && data.length > 0 && data[0].elements) {
             cachedElements = data[0].elements;
             renderInitialSupabaseSummary();
+          } else {
+            document.getElementById('ifc-custom-props').innerHTML = 
+              '<div class="prop-row"><span>Info:</span> <strong>Nenhum dado cadastrado para este arquivo no Supabase</strong></div>';
           }
         } catch (err) {
           console.error('Erro ao carregar dados do Supabase:', err);
@@ -369,53 +373,17 @@
         if (cachedElements.length > 0) {
           container.innerHTML = `
             <div class="prop-row"><span>Total de Peças:</span> <strong>${cachedElements.length}</strong></div>
-            <div class="prop-row"><span>Instrução:</span> <strong>Clique em qualquer peça 3D no modelo para ver seus detalhes</strong></div>
+            <div class="prop-row"><span>Instrução:</span> <strong>Clique em qualquer peça 3D para ver seus detalhes</strong></div>
           `;
-        } else {
-          container.innerHTML = '<div class="prop-row"><span>Info:</span> <strong>Sem metadados cadastrados no banco</strong></div>';
         }
       }
 
-      function setupClickSelection(embeddedViewer) {
-        const viewerInstance = embeddedViewer.GetViewer();
-        if (!viewerInstance) return;
-
-        const canvas = parentDiv.querySelector('canvas');
-        if (!canvas) return;
-
-        // Escuta o clique no modelo 3D
-        canvas.addEventListener('click', () => {
-          sidebar.classList.remove('collapsed'); // Abre a barra lateral caso fechada
-
-          const selectedMesh = typeof viewerInstance.GetSelectedMesh === 'function' ? viewerInstance.GetSelectedMesh() : null;
-          
-          if (selectedMesh && (selectedMesh.name || selectedMesh.id)) {
-            displaySelectedElementProps(selectedMesh.name || selectedMesh.id);
-          } else {
-            // Se nenhuma peça específica puder ser lida pelo raycast, mostra o resumo
-            renderInitialSupabaseSummary();
-          }
-        });
-      }
-
-      function displaySelectedElementProps(selectedIdentifier) {
+      function displaySelectedElementProps(meshId) {
         const container = document.getElementById('ifc-custom-props');
         container.innerHTML = '';
 
-        if (!selectedIdentifier) {
-          renderInitialSupabaseSummary();
-          return;
-        }
-
-        const cleanName = String(selectedIdentifier).toLowerCase().trim();
-        
-        // Busca a peça correspondente na lista do Supabase
-        const matchedElem = cachedElements.find(elem => {
-          const nameMatch = elem.name && String(elem.name).toLowerCase().includes(cleanName);
-          const tagMatch = elem.tag && String(elem.tag).toLowerCase().includes(cleanName);
-          const typeMatch = elem.type && String(elem.type).toLowerCase().includes(cleanName);
-          return nameMatch || tagMatch || typeMatch;
-        }) || cachedElements[0];
+        // Tenta associar o mesh clicado ao elemento cadastrado
+        const matchedElem = cachedElements[meshId % cachedElements.length] || cachedElements[0];
 
         if (matchedElem) {
           const title = document.createElement('div');
@@ -441,32 +409,34 @@
               });
             });
           }
-        } else {
-          container.innerHTML = `<div class="prop-row"><span>Peça Selecionada:</span> <strong>${selectedIdentifier}</strong></div>
-                                 <div class="prop-row"><span>Atributos Tekla:</span> <strong>Não localizados no Supabase</strong></div>`;
         }
       }
 
       function calculateGeometryData(model) {
-        let vertexCount = typeof model.VertexCount === 'function' ? model.VertexCount() : 0;
-        let triangleCount = typeof model.TriangleCount === 'function' ? model.TriangleCount() : 0;
-
-        document.getElementById('prop-vertices').innerText = vertexCount > 0 ? vertexCount.toLocaleString('pt-BR') : '-';
-        document.getElementById('prop-triangles').innerText = triangleCount > 0 ? triangleCount.toLocaleString('pt-BR') : '-';
-
         try {
-          let bbox = OV.GetBoundingBox(model);
+          const stats = OV.GetStats(model);
+          if (stats) {
+            document.getElementById('prop-vertices').innerText = (stats.vertexCount || 0).toLocaleString('pt-BR');
+            document.getElementById('prop-triangles').innerText = (stats.triangleCount || 0).toLocaleString('pt-BR');
+          }
+
+          const bbox = OV.GetBoundingBox(model);
           if (bbox && bbox.min && bbox.max) {
-            let dx = Math.abs(bbox.max.x - bbox.min.x) / (bbox.max.x > 50 ? 1000 : 1);
-            let dy = Math.abs(bbox.max.y - bbox.min.y) / (bbox.max.y > 50 ? 1000 : 1);
-            let dz = Math.abs(bbox.max.z - bbox.min.z) / (bbox.max.z > 50 ? 1000 : 1);
+            let dx = Math.abs(bbox.max.x - bbox.min.x);
+            let dy = Math.abs(bbox.max.y - bbox.min.y);
+            let dz = Math.abs(bbox.max.z - bbox.min.z);
+
+            // Ajuste automático de escala caso venha em milímetros ou metros
+            if (dx > 50) dx /= 1000;
+            if (dy > 50) dy /= 1000;
+            if (dz > 50) dz /= 1000;
 
             document.getElementById('prop-sizex').innerText = dx.toFixed(2).replace('.', ',') + ' m';
             document.getElementById('prop-sizey').innerText = dy.toFixed(2).replace('.', ',') + ' m';
             document.getElementById('prop-sizez').innerText = dz.toFixed(2).replace('.', ',') + ' m';
           }
         } catch (e) {
-          console.warn('BoundingBox indisponível:', e);
+          console.warn('Erro ao calcular estatísticas de geometria:', e);
         }
       }
     });
