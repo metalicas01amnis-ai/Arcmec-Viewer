@@ -236,12 +236,12 @@
 
     <aside class="sidebar" id="sidebar">
       <div class="sidebar-header">
-        <h3>Informações do Modelo</h3>
+        <h3>Informações da Peça</h3>
         <button class="btn-close" id="btn-close-sidebar">✕</button>
       </div>
       <div class="sidebar-content">
         <div class="prop-group">
-          <div class="prop-group-title" id="geom-title">Geometria e Malha</div>
+          <div class="prop-group-title" id="geom-title">Geometria do Modelo</div>
           <div class="prop-row"><span>Vértices:</span> <strong id="prop-vertices">Lendo...</strong></div>
           <div class="prop-row"><span>Triângulos:</span> <strong id="prop-triangles">Lendo...</strong></div>
           <div class="prop-row"><span>Dimensão X:</span> <strong id="prop-sizex">Lendo...</strong></div>
@@ -252,7 +252,7 @@
         <div class="prop-group">
           <div class="prop-group-title">Atributos Tekla / Supabase</div>
           <div id="ifc-custom-props">
-            <div class="prop-row"><span>Status:</span> <strong>Buscando dados...</strong></div>
+            <div class="prop-row"><span>Status:</span> <strong>Aguardando seleção no modelo 3D...</strong></div>
           </div>
         </div>
       </div>
@@ -262,6 +262,9 @@
   <script>
     const SUPABASE_URL = "https://cefqiwdoycpnsocwejfn.supabase.co";
     const SUPABASE_KEY = "sb_publishable_hE8XLIFJ3LKr-M3GJmWpww_F69Xaqxp";
+
+    let cachedElements = [];
+    let loadedModel = null;
 
     if (typeof OV !== 'undefined' && typeof OV.SetExternalLibLocation === 'function') {
       OV.SetExternalLibLocation('https://cdn.jsdelivr.net/npm/online-3d-viewer@0.18.0/build/engine/libs/');
@@ -299,12 +302,18 @@
       btnDownload.style.display = 'inline-flex';
       loadingText.innerText = `Processando estrutura: ${fileName}...`;
 
+      let isOverlayHidden = false;
       const hideOverlay = () => {
+        if (isOverlayHidden) return;
+        isOverlayHidden = true;
         loadingOverlay.style.opacity = '0';
         setTimeout(() => loadingOverlay.style.display = 'none', 400);
       };
 
-      // Busca as propriedades processadas pelo Python na API do Supabase
+      // Trava de segurança: oculta o overlay após 8s mesmo que o web-ifc emita avisos de curva
+      setTimeout(hideOverlay, 8000);
+
+      // Busca propriedades processadas pelo Tekla/Python no Supabase
       fetchTeklaPropertiesFromSupabase(fileName);
 
       try {
@@ -318,12 +327,15 @@
           onSuccess: (importResult) => {
             const innerViewer = embeddedViewer.GetViewer();
             if (innerViewer) innerViewer.FitToWindow();
-            if (importResult && importResult.model) calculateGeometryData(importResult.model);
+            if (importResult && importResult.model) {
+              loadedModel = importResult.model;
+              calculateGeometryData(loadedModel);
+              setupClickSelection(embeddedViewer);
+            }
             hideOverlay();
           },
           onError: (err) => {
             console.error('Erro na leitura 3D do IFC:', err);
-            // Oculta a tela de carregamento mesmo se a geometria falhar
             hideOverlay();
           }
         });
@@ -334,7 +346,6 @@
       }
 
       async function fetchTeklaPropertiesFromSupabase(filename) {
-        const container = document.getElementById('ifc-custom-props');
         try {
           const response = await fetch(`${SUPABASE_URL}/rest/v1/ifc_models?filename=eq.${encodeURIComponent(filename)}&select=*`, {
             headers: {
@@ -345,34 +356,83 @@
           
           const data = await response.json();
           if (data && data.length > 0 && data[0].elements) {
-            renderSupabaseElements(data[0].elements, container);
-          } else {
-            container.innerHTML = '<div class="prop-row"><span>Info:</span> <strong>Sem metadados no banco</strong></div>';
+            cachedElements = data[0].elements;
+            renderInitialSupabaseSummary();
           }
         } catch (err) {
           console.error('Erro ao carregar dados do Supabase:', err);
-          container.innerHTML = '<div class="prop-row"><span>Erro:</span> <strong>Falha na API</strong></div>';
         }
       }
 
-      function renderSupabaseElements(elements, container) {
+      function renderInitialSupabaseSummary() {
+        const container = document.getElementById('ifc-custom-props');
+        if (cachedElements.length > 0) {
+          container.innerHTML = `
+            <div class="prop-row"><span>Total de Peças:</span> <strong>${cachedElements.length}</strong></div>
+            <div class="prop-row"><span>Instrução:</span> <strong>Clique em qualquer peça 3D no modelo para ver seus detalhes</strong></div>
+          `;
+        } else {
+          container.innerHTML = '<div class="prop-row"><span>Info:</span> <strong>Sem metadados cadastrados no banco</strong></div>';
+        }
+      }
+
+      function setupClickSelection(embeddedViewer) {
+        const viewerInstance = embeddedViewer.GetViewer();
+        if (!viewerInstance) return;
+
+        const canvas = parentDiv.querySelector('canvas');
+        if (!canvas) return;
+
+        // Escuta o clique no modelo 3D
+        canvas.addEventListener('click', () => {
+          sidebar.classList.remove('collapsed'); // Abre a barra lateral caso fechada
+
+          const selectedMesh = typeof viewerInstance.GetSelectedMesh === 'function' ? viewerInstance.GetSelectedMesh() : null;
+          
+          if (selectedMesh && (selectedMesh.name || selectedMesh.id)) {
+            displaySelectedElementProps(selectedMesh.name || selectedMesh.id);
+          } else {
+            // Se nenhuma peça específica puder ser lida pelo raycast, mostra o resumo
+            renderInitialSupabaseSummary();
+          }
+        });
+      }
+
+      function displaySelectedElementProps(selectedIdentifier) {
+        const container = document.getElementById('ifc-custom-props');
         container.innerHTML = '';
-        elements.slice(0, 10).forEach(elem => {
+
+        if (!selectedIdentifier) {
+          renderInitialSupabaseSummary();
+          return;
+        }
+
+        const cleanName = String(selectedIdentifier).toLowerCase().trim();
+        
+        // Busca a peça correspondente na lista do Supabase
+        const matchedElem = cachedElements.find(elem => {
+          const nameMatch = elem.name && String(elem.name).toLowerCase().includes(cleanName);
+          const tagMatch = elem.tag && String(elem.tag).toLowerCase().includes(cleanName);
+          const typeMatch = elem.type && String(elem.type).toLowerCase().includes(cleanName);
+          return nameMatch || tagMatch || typeMatch;
+        }) || cachedElements[0];
+
+        if (matchedElem) {
           const title = document.createElement('div');
           title.className = 'prop-group-subtitle';
-          title.innerText = `${elem.type} - ${elem.name || 'Elemento'}`;
+          title.innerText = `${matchedElem.type || 'Elemento'} - ${matchedElem.name || matchedElem.tag || 'Selecionado'}`;
           container.appendChild(title);
 
-          if (elem.tag) {
+          if (matchedElem.tag) {
             const rowTag = document.createElement('div');
             rowTag.className = 'prop-row';
-            rowTag.innerHTML = `<span>Tag:</span> <strong>${elem.tag}</strong>`;
+            rowTag.innerHTML = `<span>Tag/Marca:</span> <strong>${matchedElem.tag}</strong>`;
             container.appendChild(rowTag);
           }
 
-          if (elem.properties) {
-            Object.keys(elem.properties).forEach(psetName => {
-              const props = elem.properties[psetName];
+          if (matchedElem.properties) {
+            Object.keys(matchedElem.properties).forEach(psetName => {
+              const props = matchedElem.properties[psetName];
               Object.keys(props).forEach(pKey => {
                 const row = document.createElement('div');
                 row.className = 'prop-row';
@@ -381,7 +441,10 @@
               });
             });
           }
-        });
+        } else {
+          container.innerHTML = `<div class="prop-row"><span>Peça Selecionada:</span> <strong>${selectedIdentifier}</strong></div>
+                                 <div class="prop-row"><span>Atributos Tekla:</span> <strong>Não localizados no Supabase</strong></div>`;
+        }
       }
 
       function calculateGeometryData(model) {
